@@ -1189,6 +1189,10 @@ class NemotronH_Nano_VL_V2(
         # TODO: Maybe this can be optimized to avoid the loop?
         for i, single_video_embeddings in enumerate(video_embeddings):
             num_frames = video_input["num_patches"][i].item()
+            print(
+                f"Processing single video embedding "
+                f"{single_video_embeddings.shape=} {num_frames=}"
+            )
             assert single_video_embeddings.shape[0] % num_frames == 0
 
             if video_pruning_rate is not None and video_pruning_rate > 0.0:

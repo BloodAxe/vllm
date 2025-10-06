@@ -452,6 +452,10 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                 dynamic_image_size=dynamic_image_size,
             )
 
+            print("Processing video inputs:")
+            print("Num frames", pixel_values_lst_video)
+            print("Shapes", *[x.shape for x in pixel_values_lst_video])
+
             video_inputs = {
                 "pixel_values_flat_video": torch.cat(pixel_values_lst_video),
                 "video_num_patches": torch.tensor(
@@ -1159,6 +1163,7 @@ class NemotronH_Nano_VL_V2(nn.Module, HasInnerState, IsHybrid, SupportsMultiModa
         """Process video input and create final embeddings with video content
         and indicator tokens."""
         # Get video embeddings using the same processing as images
+        print("_process_video_input", video_input["pixel_values_flat"].shape)
         video_embeddings = self._process_image_input(video_input)
 
         final_video_embeddings: tuple[torch.Tensor, ...] = ()

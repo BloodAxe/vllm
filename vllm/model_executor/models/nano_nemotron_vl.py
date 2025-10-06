@@ -453,7 +453,6 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             )
 
             print("Processing video inputs:")
-            print("Num frames", pixel_values_lst_video)
             print("Shapes", *[x.shape for x in pixel_values_lst_video])
 
             video_inputs = {

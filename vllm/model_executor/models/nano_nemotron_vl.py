@@ -1168,7 +1168,11 @@ class NemotronH_Nano_VL_V2(
         """Process video input and create final embeddings with video content
         and indicator tokens."""
         # Get video embeddings using the same processing as images
-        print("_process_video_input", video_input["pixel_values_flat"].shape)
+        print(
+            "_process_video_input",
+            video_input["pixel_values_flat"].shape,
+            video_input["num_patches"],
+        )
         video_embeddings = self._process_image_input(video_input)
 
         final_video_embeddings: tuple[torch.Tensor, ...] = ()

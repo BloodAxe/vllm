@@ -483,6 +483,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                         q=self.video_pruning_rate,
                     )
 
+                    print("EVS: Estimated number of tokens (PRE-EVS)", num_tokens)
                     # Here we just need placeholders that won't actually be replaced -
                     # we just need to make sure the total number of tokens is correct
                     # assign all tokens to the first frame
@@ -1198,6 +1199,11 @@ class NemotronH_Nano_VL_V2(nn.Module, HasInnerState, IsHybrid, SupportsMultiModa
                 num_tokens_per_frame = (
                     retention_mask_thw.sum(dim=(1, 2)).long().tolist()
                 )
+                print(
+                    "EVS: Effective number of tokens (POST-EVS)",
+                    retention_mask_thw.sum().item(),
+                )
+
                 # End of EVS-specific code
             else:
                 feature_size = single_video_embeddings.shape[0] // num_frames

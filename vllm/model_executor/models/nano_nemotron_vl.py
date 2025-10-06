@@ -30,6 +30,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsMultiModalPruning,
 )
 from vllm.model_executor.models.internvl import (
     calculate_internvl_targets,
@@ -452,8 +453,10 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                 dynamic_image_size=dynamic_image_size,
             )
 
-            print("Processing video inputs:")
-            print("Shapes", *[x.shape for x in pixel_values_lst_video])
+            print("Processing video inputs (NanoNemotronVLProcessor):")
+            print("Num videos", len(videos))
+            print("Num Frames in each video", [len(x) for x in videos])
+            print("Video shapes", *[x.shape for x in pixel_values_lst_video])
 
             video_inputs = {
                 "pixel_values_flat_video": torch.cat(pixel_values_lst_video),
@@ -986,7 +989,9 @@ class NanoNemotronVLDummyInputsBuilder(
     info=NanoNemotronVLProcessingInfo,
     dummy_inputs=NanoNemotronVLDummyInputsBuilder,
 )
-class NemotronH_Nano_VL_V2(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal):
+class NemotronH_Nano_VL_V2(
+    nn.Module, HasInnerState, IsHybrid, SupportsMultiModal, SupportsMultiModalPruning
+):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
         if modality.startswith("image"):

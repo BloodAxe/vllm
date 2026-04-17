@@ -538,11 +538,6 @@ class RadioParallelAttention(InternParallelAttention):
         return out
 
 
-@support_torch_compile(
-    dynamic_arg_dims={"hidden_states": [0, 1], "cu_seqlens": 0},
-    mark_unbacked_dims={"cu_seqlens": 0},
-    enable_if=should_torch_compile_mm_encoder,
-)
 class RadioVisionEncoderLayer(InternVisionEncoderLayer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, attn_cls=RadioParallelAttention, **kwargs)
@@ -568,6 +563,12 @@ class RadioVisionEncoderLayer(InternVisionEncoderLayer):
         return hidden_states
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"inputs_embeds": [0, 1], "cu_seqlens": 0},
+    mark_unbacked_dims={"cu_seqlens": 0},
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class RadioVisionEncoder(InternVisionEncoder):
     def __init__(self, *args, **kwargs) -> None:
         with set_model_tag("RadioVisionEncoderLayer", is_encoder=True):
@@ -576,13 +577,10 @@ class RadioVisionEncoder(InternVisionEncoder):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        mask_meta: MaskMetadata | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ):
         hidden_states = inputs_embeds
-        cu_seqlens, max_seqlen = None, None
-        if mask_meta is not None:
-            cu_seqlens = mask_meta.cu_seqlens
-            max_seqlen = mask_meta.max_seqlen
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
                 hidden_states,
@@ -705,7 +703,13 @@ class RadioInternVisionModel(nn.Module):
                     imgs_sizes, device=hidden_states.device
                 )
 
-        encoder_outputs = self.encoder(inputs_embeds=hidden_states, mask_meta=mask_meta)
+        cu_seqlens = mask_meta.cu_seqlens if mask_meta is not None else None
+        max_seqlen = mask_meta.max_seqlen if mask_meta is not None else None
+        encoder_outputs = self.encoder(
+            inputs_embeds=hidden_states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
 
         # Unpack back to original batch shape if we packed for video
         if packed_batch_size is not None:

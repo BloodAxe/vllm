@@ -1690,13 +1690,26 @@ class NemotronH_Nano_VL_V2(
         out_per_tile = self.num_image_token
         num_tiles = (token_budget + out_per_tile - 1) // out_per_tile
         H = W = self.config.force_image_size
+        H_patches = H // self.patch_size
+        num_skip = self.vision_model.model.patch_generator.num_skip
+        L_full = H_patches * H_patches + num_skip
+
+        # Constant cu_seqlens [0, L, 2L, ..., num_tiles*L]: never updated
+        # between replays — padded tiles process garbage but outputs are discarded.
+        cu_seqlens = torch.arange(
+            0, (num_tiles + 1) * L_full, step=L_full,
+            dtype=torch.int32, device=device,
+        )
+
         pixel_values = torch.randn(num_tiles, 3, H, W, device=device, dtype=dtype)
         mm_kwargs = {
             "pixel_values_flat": pixel_values,
             "image_num_patches": torch.tensor([num_tiles],
                                               device=device, dtype=torch.int32),
         }
-        return EncoderCudaGraphCaptureInputs(mm_kwargs=mm_kwargs, buffers={})
+        return EncoderCudaGraphCaptureInputs(
+            mm_kwargs=mm_kwargs, buffers={"cu_seqlens": cu_seqlens}
+        )
 
     def prepare_encoder_cudagraph_replay_buffers(
         self,
@@ -1709,7 +1722,9 @@ class NemotronH_Nano_VL_V2(
         return EncoderCudaGraphReplayBuffers(buffers={})
 
     def _encode_images_no_microbatch(
-        self, pixel_values: torch.Tensor
+        self,
+        pixel_values: torch.Tensor,
+        cu_seqlens_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run encoder + projection on a fixed-size tile batch (no chunking).
         Used for CUDA graph capture and replay."""
@@ -1717,7 +1732,10 @@ class NemotronH_Nano_VL_V2(
         H_patches = H // self.patch_size
         W_patches = W // self.patch_size
         with set_forward_context(None, self.vllm_config):
-            _, vit_embeds = self.vision_model(pixel_values)
+            _, vit_embeds = self.vision_model(
+                pixel_values,
+                cu_seqlens_override=cu_seqlens_override,
+            )
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
         vit_embeds = vit_embeds.reshape(N, H_patches, W_patches, -1)
         vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
@@ -1727,7 +1745,10 @@ class NemotronH_Nano_VL_V2(
     def encoder_cudagraph_forward(
         self, mm_kwargs: dict, buffers: dict
     ) -> torch.Tensor:
-        return self._encode_images_no_microbatch(mm_kwargs["pixel_values_flat"])
+        return self._encode_images_no_microbatch(
+            mm_kwargs["pixel_values_flat"],
+            cu_seqlens_override=buffers.get("cu_seqlens"),
+        )
 
     def encoder_eager_forward(self, mm_kwargs: dict) -> torch.Tensor:
         pixel_values = mm_kwargs["pixel_values_flat"]

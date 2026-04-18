@@ -519,26 +519,21 @@ class RadioParallelAttention(InternParallelAttention):
 
 def radio_vision_encoder_invariants(
     hidden_states: torch.Tensor,
-    cu_seqlens: torch.Tensor | None = None,
-    max_seqlen: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int | torch.Tensor | None = None,
 ):
     """Shape invariants for RadioVisionEncoder.
 
-    These are translated to runtime assertions for unbacked dynamic shapes
-    and are compiled away for backed shapes (see llama_model_invariants
-    for the same pattern).
-
-    When `cu_seqlens` is provided, the encoder receives a packed layout:
+    The encoder always uses sequence-packed layout:
       - `hidden_states` has shape `[1, total_tokens, hidden]`
       - `cu_seqlens` has shape `[num_sequences + 1]` with num_sequences >= 1
     """
-    if cu_seqlens is not None:
-        torch._check(hidden_states.size(0) == 1)
-        torch._check(cu_seqlens.size(0) >= 2)
+    torch._check(hidden_states.size(0) == 1)
+    torch._check(cu_seqlens.size(0) >= 2)
 
 
 @support_torch_compile(
-    dynamic_arg_dims={"hidden_states": [0, 1], "cu_seqlens": 0},
+    dynamic_arg_dims={"hidden_states": [1], "cu_seqlens": 0},
     mark_unbacked_dims={"cu_seqlens": 0},
     enable_if=should_torch_compile_mm_encoder,
     is_encoder=True,
@@ -551,8 +546,8 @@ class RadioVisionEncoderLayer(InternVisionEncoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor | None = None,
     ):
         hidden_states = (
             hidden_states
@@ -577,8 +572,8 @@ class RadioVisionEncoder(InternVisionEncoder):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor | None = None,
     ):
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
@@ -677,52 +672,65 @@ class RadioInternVisionModel(nn.Module):
         x: torch.Tensor,
         imgs_sizes: list[tuple[int, int]] | None = None,
         num_frames: int | None = None,
+        *,
+        cu_seqlens_override: torch.Tensor | None = None,
     ) -> torch.FloatTensor:
         T = self.temporal_patch_size
 
-        # Build packed-sequence metadata for MMEncoderAttention when needed.
-        mask_meta = None
-        packed_batch_size = None  # Original batch size before packing
+        packed_batch_size = None  # set for video tubelets unpack
+        image_pack_seq_len = None  # set for static-image unpack
 
         if num_frames is not None and T > 1:
-            # Conv3d video: all tubelets have the same sequence length.
-            # Pack [num_tubelets, seq_per_tubelet, hidden] → [1, total, hidden]
+            # Conv3d video: pack tubelets → (1, total, hidden) with cu_seqlens.
             hidden_states = self.patch_generator.forward_video(x)
             packed_batch_size, seq_per_tubelet, hidden_dim = hidden_states.shape
             hidden_states = hidden_states.reshape(1, -1, hidden_dim)
             mask_meta = self._inter_image_mask_metadata_from_seq_lens(
                 [seq_per_tubelet] * packed_batch_size, device=hidden_states.device
             )
+            cu_seqlens = mask_meta.cu_seqlens
+            max_seqlen = mask_meta.max_seqlen
         else:
-            # Images for any model, or video for non-conv3d model
             hidden_states = self.patch_generator(x, imgs_sizes=imgs_sizes)
             if imgs_sizes is not None and len(imgs_sizes) > 1:
-                # Dynamic resolution w/ > 1 image, create attn mask
+                # Dynamic multi-image: mask_meta provides per-image boundaries.
                 mask_meta = self.inter_image_mask_metadata(
                     imgs_sizes, device=hidden_states.device
                 )
-
-        if mask_meta is None:
-            B, L = hidden_states.shape[0], hidden_states.shape[1]
-            if B == 1:
-                cu_seqlens = torch.tensor([0, L], dtype=torch.int32, device=hidden_states.device)
-                max_seqlen = torch.tensor(L, dtype=torch.int32)  # CPU: avoids .item() sync
+                cu_seqlens = mask_meta.cu_seqlens
+                max_seqlen = mask_meta.max_seqlen
             else:
-                cu_seqlens = None
-                max_seqlen = None
-        else:
-            cu_seqlens = mask_meta.cu_seqlens
-            max_seqlen = mask_meta.max_seqlen
+                # Static resolution: pack B tiles → (1, B*L, H).
+                # max_seqlen = L is always derivable from shape; no override needed.
+                # CPU tensor matches the convention from _inter_image_mask_metadata_from_seq_lens.
+                B, L, D = hidden_states.shape
+                image_pack_seq_len = L
+                max_seqlen = torch.tensor(L, dtype=torch.int32)
+                hidden_states = hidden_states.reshape(1, -1, D)
+                if cu_seqlens_override is not None:
+                    cu_seqlens = cu_seqlens_override
+                else:
+                    cu_seqlens = torch.arange(
+                        0, (B + 1) * L, step=L,
+                        dtype=torch.int32, device=hidden_states.device,
+                    )
+
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
 
-        # Unpack back to original batch shape if we packed for video
+        # Unpack video tubelets back to (num_tubelets, seq_per_tubelet, H).
         if packed_batch_size is not None:
             encoder_outputs = encoder_outputs.reshape(
                 packed_batch_size, seq_per_tubelet, -1
+            )
+
+        # Unpack static images from (1, B*L, H) back to (B, L, H).
+        if image_pack_seq_len is not None:
+            encoder_outputs = encoder_outputs.reshape(
+                -1, image_pack_seq_len, encoder_outputs.shape[-1]
             )
 
         return encoder_outputs
@@ -769,11 +777,13 @@ class RadioModel(nn.Module):
         *,
         imgs_sizes: list[tuple[int, int]] | None = None,
         num_frames: int | None = None,
+        cu_seqlens_override: torch.Tensor | None = None,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         y = self.model(
             pixel_values,
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
+            cu_seqlens_override=cu_seqlens_override,
         )
         return self._extract_final(y, imgs_sizes=imgs_sizes)
 

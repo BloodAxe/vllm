@@ -12,7 +12,7 @@ import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
 from io import BytesIO
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, ClassVar, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -30,6 +30,7 @@ from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
     MultiModalEmbeddings,
+    SupportsEncoderCudaGraph,
     SupportsMultiModal,
     SupportsMultiModalPruning,
 )
@@ -900,7 +901,12 @@ class NanoNemotronVLDummyInputsBuilder(
     dummy_inputs=NanoNemotronVLDummyInputsBuilder,
 )
 class NemotronH_Nano_VL_V2(
-    nn.Module, HasInnerState, IsHybrid, SupportsMultiModal, SupportsMultiModalPruning
+    nn.Module,
+    HasInnerState,
+    IsHybrid,
+    SupportsMultiModal,
+    SupportsMultiModalPruning,
+    SupportsEncoderCudaGraph,
 ):
     requires_sequential_video_encoding = True
     """Temporarily needed for dynamic res video w/ conv3d, doesn't support bs>1 yet"""
@@ -1601,3 +1607,130 @@ class NemotronH_Nano_VL_V2(
     @classmethod
     def get_mamba_state_copy_func(cls):
         return NemotronHForCausalLM.get_mamba_state_copy_func()
+
+    # -- SupportsEncoderCudaGraph protocol methods --
+    # Supports static-resolution image CUDA graphs.
+    # Video graphs are disabled when EVS pruning is active (data-dependent
+    # token count).  Dynamic-resolution images are also excluded because their
+    # per-image H×W varies and cannot be captured in a fixed-shape graph.
+
+    supports_encoder_cudagraph: ClassVar[Literal[True]] = True
+
+    def _is_evs_enabled(self) -> bool:
+        return self.video_pruning_rate is not None and self.video_pruning_rate > 0.0
+
+    def get_encoder_cudagraph_config(self):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
+
+        if self.dynamic_resolution:
+            # Variable H×W per image — not compatible with fixed-shape graphs.
+            modalities: list[str] = []
+        else:
+            modalities = ["image"]
+            if not self._is_evs_enabled():
+                modalities.append("video")
+
+        return EncoderCudaGraphConfig(
+            modalities=modalities,
+            input_key_by_modality={"image": "pixel_values_flat",
+                                   "video": "pixel_values_flat"},
+            buffer_keys=[],
+            out_hidden_size=self.config.text_config.hidden_size,
+        )
+
+    def get_input_modality(self, mm_kwargs: dict) -> str:
+        return "video" if "video_num_patches" in mm_kwargs else "image"
+
+    def get_encoder_cudagraph_budget_range(self, vllm_config) -> tuple[int, int]:
+        min_budget = self.num_image_token  # one tile's output tokens
+        max_budget = vllm_config.scheduler_config.max_num_batched_tokens
+        return (min_budget, max_budget)
+
+    def get_encoder_cudagraph_num_items(self, mm_kwargs: dict) -> int:
+        patches = mm_kwargs.get("image_num_patches", mm_kwargs.get("video_num_patches"))
+        return len(patches)
+
+    def get_encoder_cudagraph_per_item_output_tokens(self, mm_kwargs: dict) -> list[int]:
+        patches = mm_kwargs.get("image_num_patches", mm_kwargs.get("video_num_patches"))
+        return [int(n) * self.num_image_token for n in patches]
+
+    def get_encoder_cudagraph_per_item_input_sizes(self, mm_kwargs: dict) -> list[int]:
+        patches = mm_kwargs.get("image_num_patches", mm_kwargs.get("video_num_patches"))
+        return [int(n) for n in patches]
+
+    def select_encoder_cudagraph_items(
+        self, mm_kwargs: dict, indices: list[int]
+    ) -> dict:
+        patches_key = "image_num_patches" if "image_num_patches" in mm_kwargs \
+            else "video_num_patches"
+        num_patches = mm_kwargs[patches_key]
+        cum = [0]
+        for n in num_patches:
+            cum.append(cum[-1] + int(n))
+        pixel_values = mm_kwargs["pixel_values_flat"]
+        selected_pv = torch.cat([pixel_values[cum[i]:cum[i + 1]] for i in indices])
+        selected_np = torch.tensor([num_patches[i] for i in indices],
+                                   dtype=num_patches.dtype)
+        result = {k: v for k, v in mm_kwargs.items()
+                  if k not in ("pixel_values_flat", patches_key)}
+        result["pixel_values_flat"] = selected_pv
+        result[patches_key] = selected_np
+        return result
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphCaptureInputs
+
+        out_per_tile = self.num_image_token
+        num_tiles = (token_budget + out_per_tile - 1) // out_per_tile
+        H = W = self.config.force_image_size
+        pixel_values = torch.randn(num_tiles, 3, H, W, device=device, dtype=dtype)
+        mm_kwargs = {
+            "pixel_values_flat": pixel_values,
+            "image_num_patches": torch.tensor([num_tiles],
+                                              device=device, dtype=torch.int32),
+        }
+        return EncoderCudaGraphCaptureInputs(mm_kwargs=mm_kwargs, buffers={})
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers
+
+        return EncoderCudaGraphReplayBuffers(buffers={})
+
+    def _encode_images_no_microbatch(
+        self, pixel_values: torch.Tensor
+    ) -> torch.Tensor:
+        """Run encoder + projection on a fixed-size tile batch (no chunking).
+        Used for CUDA graph capture and replay."""
+        N, _C, H, W = pixel_values.shape
+        H_patches = H // self.patch_size
+        W_patches = W // self.patch_size
+        with set_forward_context(None, self.vllm_config):
+            _, vit_embeds = self.vision_model(pixel_values)
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        vit_embeds = vit_embeds.reshape(N, H_patches, W_patches, -1)
+        vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
+        vit_embeds = self.mlp1(vit_embeds.reshape(N, -1, vit_embeds.shape[-1]))
+        return vit_embeds.reshape(-1, self.config.text_config.hidden_size)
+
+    def encoder_cudagraph_forward(
+        self, mm_kwargs: dict, buffers: dict
+    ) -> torch.Tensor:
+        return self._encode_images_no_microbatch(mm_kwargs["pixel_values_flat"])
+
+    def encoder_eager_forward(self, mm_kwargs: dict) -> torch.Tensor:
+        pixel_values = mm_kwargs["pixel_values_flat"]
+        return self.extract_feature(pixel_values).reshape(
+            -1, self.config.text_config.hidden_size
+        )

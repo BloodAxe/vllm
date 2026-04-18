@@ -17,7 +17,6 @@ from typing import TypeAlias
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 from transformers import PretrainedConfig
 
 from vllm.compilation.backends import set_model_tag
@@ -236,24 +235,16 @@ class ViTPatchGenerator(nn.Module):
         patches = self.im_to_patches(x)  # [N, num_patches, 3*P*P]
         num_frames, num_spatial, feat_dim = patches.shape
 
-        # Pad to a multiple of T by repeating the last frame so that
-        # all tubelets have exactly T frames.
         num_pad_frames = (-num_frames) % T
-        if num_pad_frames > 0:
-            last_frame_dup = patches[-1:].expand(num_pad_frames, -1, -1)
-            patches = torch.cat([patches, last_frame_dup], dim=0)
+        pad = patches[-1:].expand(num_pad_frames, -1, -1)
+        patches = torch.cat([patches, pad], dim=0)
 
-        # Group T frames per tubelet: for each spatial position, concatenate
-        #   features across T consecutive frames; order follows Megatron training
         num_frames_padded = patches.shape[0]
         num_tublets = num_frames_padded // T
-        patches = rearrange(
-            patches,
-            "(tubelets frames) spatial feat -> tubelets spatial (frames feat)",
-            tubelets=num_tublets,
-            frames=T,
-            spatial=num_spatial,
-            feat=feat_dim,
+        patches = (
+            patches.view(num_tublets, T, num_spatial, feat_dim)
+                   .permute(0, 2, 1, 3)
+                   .reshape(num_tublets, num_spatial, T * feat_dim)
         )
 
         patches = self.video_embedder(patches)
@@ -344,9 +335,8 @@ class ViTPatchGenerator(nn.Module):
                 "Unable to interpolate non-square embedding"
             )
 
-            src_embed = rearrange(
-                src_embed, "b (h w) c -> b c h w", h=src_size, w=src_size
-            )
+            b, _, c = src_embed.shape
+            src_embed = src_embed.reshape(b, src_size, src_size, c).permute(0, 3, 1, 2)
             src_embed = F.interpolate(
                 src_embed,
                 size=(self.num_rows, self.num_cols),
@@ -354,7 +344,8 @@ class ViTPatchGenerator(nn.Module):
                 align_corners=True,
                 antialias=False,
             )
-            src_embed = rearrange(src_embed, "b c h w -> b (h w) c")
+            b, c, h, w = src_embed.shape
+            src_embed = src_embed.permute(0, 2, 3, 1).reshape(b, h * w, c)
         targ_embed.data.copy_(src_embed)
 
     def _load_projection(
@@ -367,13 +358,7 @@ class ViTPatchGenerator(nn.Module):
                 "Unable to interpolate non-square patch size"
             )
 
-            src_proj_weight = rearrange(
-                src_proj_weight,
-                "b (c h w) -> b c h w",
-                c=3,
-                h=src_patch_size,
-                w=src_patch_size,
-            )
+            src_proj_weight = src_proj_weight.reshape(src_proj_weight.shape[0], 3, src_patch_size, src_patch_size)
             src_proj_weight = F.interpolate(
                 src_proj_weight,
                 size=(self.patch_size, self.patch_size),
@@ -381,7 +366,7 @@ class ViTPatchGenerator(nn.Module):
                 align_corners=True,
                 antialias=False,
             )
-            src_proj_weight = rearrange(src_proj_weight, "b c h w -> b (c h w)")
+            src_proj_weight = src_proj_weight.reshape(src_proj_weight.shape[0], -1)
         targ_proj_weight.data.copy_(src_proj_weight)
 
     def embed_patches(self, x: torch.Tensor) -> torch.Tensor:
@@ -481,21 +466,15 @@ class Im2Patches(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.patch_size == 1:
-            patches = x.flatten(2)
-            patches = patches.permute(0, 2, 1)
-            return patches
-
-        py = x.shape[-2] // self.patch_size
-        px = x.shape[-1] // self.patch_size
-        patches = rearrange(
-            x,
-            "b c (py yy) (px xx) -> b (py px) (c yy xx)",
-            py=py,
-            yy=self.patch_size,
-            px=px,
-            xx=self.patch_size,
+            return x.flatten(2).permute(0, 2, 1)
+        P = self.patch_size
+        B, C, H, W = x.shape
+        Hp, Wp = H // P, W // P
+        return (
+            x.reshape(B, C, Hp, P, Wp, P)
+             .permute(0, 2, 4, 1, 3, 5)
+             .reshape(B, Hp * Wp, C * P * P)
         )
-        return patches
 
 
 class ViTPatchLinear(nn.Linear):
@@ -538,6 +517,33 @@ class RadioParallelAttention(InternParallelAttention):
         return out
 
 
+def radio_vision_encoder_invariants(
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+):
+    """Shape invariants for RadioVisionEncoder.
+
+    These are translated to runtime assertions for unbacked dynamic shapes
+    and are compiled away for backed shapes (see llama_model_invariants
+    for the same pattern).
+
+    When `cu_seqlens` is provided, the encoder receives a packed layout:
+      - `hidden_states` has shape `[1, total_tokens, hidden]`
+      - `cu_seqlens` has shape `[num_sequences + 1]` with num_sequences >= 1
+    """
+    if cu_seqlens is not None:
+        torch._check(hidden_states.size(0) == 1)
+        torch._check(cu_seqlens.size(0) >= 2)
+
+
+@support_torch_compile(
+    dynamic_arg_dims={"hidden_states": [0, 1], "cu_seqlens": 0},
+    mark_unbacked_dims={"cu_seqlens": 0},
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+    shape_invariants=radio_vision_encoder_invariants,
+)
 class RadioVisionEncoderLayer(InternVisionEncoderLayer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, attn_cls=RadioParallelAttention, **kwargs)
@@ -563,12 +569,6 @@ class RadioVisionEncoderLayer(InternVisionEncoderLayer):
         return hidden_states
 
 
-@support_torch_compile(
-    dynamic_arg_dims={"inputs_embeds": [0, 1], "cu_seqlens": 0},
-    mark_unbacked_dims={"cu_seqlens": 0},
-    enable_if=should_torch_compile_mm_encoder,
-    is_encoder=True,
-)
 class RadioVisionEncoder(InternVisionEncoder):
     def __init__(self, *args, **kwargs) -> None:
         with set_model_tag("RadioVisionEncoderLayer", is_encoder=True):
@@ -668,8 +668,7 @@ class RadioInternVisionModel(nn.Module):
         cu_seqlens = torch.tensor(
             list(accumulate(seq_lens, initial=0)), dtype=torch.int32, device=device
         )
-        # Keep max_seqlen on CPU to avoid .item() sync
-        # See: https://github.com/vllm-project/vllm/blob/20b6b01/vllm/v1/attention/ops/vit_attn_wrappers.py#L48
+        # Keep on CPU to avoid .item() device sync in the attention wrapper.
         max_seqlen = torch.tensor(max(seq_lens), dtype=torch.int32)
         return MaskMetadata(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
@@ -703,8 +702,17 @@ class RadioInternVisionModel(nn.Module):
                     imgs_sizes, device=hidden_states.device
                 )
 
-        cu_seqlens = mask_meta.cu_seqlens if mask_meta is not None else None
-        max_seqlen = mask_meta.max_seqlen if mask_meta is not None else None
+        if mask_meta is None:
+            B, L = hidden_states.shape[0], hidden_states.shape[1]
+            if B == 1:
+                cu_seqlens = torch.tensor([0, L], dtype=torch.int32, device=hidden_states.device)
+                max_seqlen = torch.tensor(L, dtype=torch.int32)  # CPU: avoids .item() sync
+            else:
+                cu_seqlens = None
+                max_seqlen = None
+        else:
+            cu_seqlens = mask_meta.cu_seqlens
+            max_seqlen = mask_meta.max_seqlen
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             cu_seqlens=cu_seqlens,
